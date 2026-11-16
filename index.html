@@ -182,6 +182,12 @@
           <div class="pal" data-type="decision"><svg width="40" height="22"><polygon points="20,1 39,11 20,21 1,11" fill="#FF9500"/></svg>Decide</div>
           <div class="pal" data-type="end"><svg width="40" height="22"><rect x="1" y="3" width="38" height="16" fill="#FF3B30"/></svg>End</div>
         </div>
+        <h2 style="margin-top:14px">Swimlanes (one column per owner)</h2>
+        <div class="row">
+          <button id="bLane">+ Lane</button>
+          <button id="bLaneAuto" title="Make a lane for every owner and move each step into it">From owners</button>
+          <button id="bLaneOff" class="danger" title="Remove all lanes (shapes stay)">Clear</button>
+        </div>
       </section>
       <div class="panel" id="details"></div>
       <div class="panel" id="summary"></div>
@@ -214,6 +220,7 @@
       <g id="world">
         <rect x="-20000" y="-20000" width="40000" height="40000" fill="url(#grid2)"/>
         <rect x="-20000" y="-20000" width="40000" height="40000" fill="url(#grid)"/>
+        <g id="laneLayer"></g>
         <g id="edgeLayer"></g>
         <g id="nodeLayer"></g>
         <line id="tempLine" stroke="#007AFF" stroke-width="2" stroke-dasharray="5 4" visibility="hidden"/>
@@ -242,7 +249,8 @@
 
 <script>
 // ==LOGIC==
-const LIMITS = { nodes: 300, edges: 600, text: 200, notes: 2000, name: 80 };
+const LIMITS = { nodes: 300, edges: 600, text: 200, notes: 2000, name: 80, lanes: 20 };
+const LANE_W = 280, LANE_HEAD = 40;
 const SIZE = { start:{w:140,h:48}, end:{w:140,h:48}, step:{w:180,h:64}, decision:{w:150,h:92} };
 const TYPES = Object.keys(SIZE);
 const OWNER_COLORS = ['#007AFF','#AF52DE','#FF2D55','#30B0C7','#5856D6','#FF9500','#00C7BE','#A2845E'];
@@ -291,7 +299,19 @@ function validate(obj){
     edges.push({ id: str(e.id, 40) || uid(), from, to, label: str(e.label, 40) });
   }
   const out = { v:1, name: str(obj.name, LIMITS.name) || 'Untitled workflow', nodes, edges };
-  if (loose) autoLayout(out);
+  // Swimlanes: a list of names (or {id, name}); each is a column LANE_W wide, starting at laneX.
+  if (Array.isArray(obj.lanes) && obj.lanes.length){
+    const lanes = [], lids = new Set();
+    for (const l of obj.lanes.slice(0, LIMITS.lanes)){
+      const name = str(typeof l === 'string' ? l : (l && l.name), 40).trim() || 'Lane';
+      let id = (l && typeof l === 'object' && str(l.id, 40)) || uid();
+      if (lids.has(id)) id = uid();
+      lids.add(id); lanes.push({ id, name });
+    }
+    out.lanes = lanes;
+    out.laneX = typeof obj.laneX === 'number' ? Math.max(-19000, Math.min(19000, obj.laneX)) : -LANE_W/2;
+  }
+  if (loose){ autoLayout(out); if (out.lanes) placeIntoLanes(out); }
   return out;
 }
 // Top-to-bottom layout: each shape sits one row below the shape that first leads to it.
@@ -340,6 +360,94 @@ function removeNode(wf, id){
 }
 function removeEdge(wf, id){ wf.edges = wf.edges.filter(e => e.id !== id); }
 
+// ---- swimlanes: side-by-side columns, one per owner. A step or decision dropped in a lane takes the lane's name as its owner.
+function hasLanes(wf){ return !!(wf.lanes && wf.lanes.length); }
+function laneX0(wf){ return typeof wf.laneX === 'number' ? wf.laneX : -LANE_W/2; }
+function laneSpan(wf, i){ const x0 = laneX0(wf) + i*LANE_W; return { x0, x1: x0 + LANE_W, cx: x0 + LANE_W/2 }; }
+function laneIndexAt(wf, x){
+  if (!hasLanes(wf)) return -1;
+  const i = Math.floor((x - laneX0(wf)) / LANE_W);
+  return i >= 0 && i < wf.lanes.length ? i : -1;
+}
+function laneExtent(wf){ const b = nodeBounds(wf); return { y0: b.y - LANE_HEAD - 30, y1: b.y + b.h + 40 }; }
+function addLane(wf, name){
+  if (!hasLanes(wf)){ wf.lanes = []; const b = nodeBounds(wf); wf.laneX = wf.nodes.length ? snap(b.x + b.w/2 - LANE_W/2) : -LANE_W/2; }
+  if (wf.lanes.length >= LIMITS.lanes) return null;
+  const l = { id: uid(), name: str(name, 40).trim() || ('Lane ' + (wf.lanes.length + 1)) };
+  wf.lanes.push(l);
+  return l;
+}
+function claimOwner(wf, n){
+  if (!n || (n.type !== 'step' && n.type !== 'decision')) return;
+  const i = laneIndexAt(wf, n.x);
+  if (i >= 0) n.owner = wf.lanes[i].name;
+}
+function removeLane(wf, id){
+  const i = (wf.lanes || []).findIndex(l => l.id === id);
+  if (i < 0) return;
+  const s = laneSpan(wf, i);
+  for (const n of wf.nodes) if (n.x >= s.x1) n.x -= LANE_W; // close the gap
+  wf.lanes.splice(i, 1);
+  if (!wf.lanes.length){ delete wf.lanes; delete wf.laneX; }
+}
+function clearLanes(wf){ delete wf.lanes; delete wf.laneX; }
+function moveLane(wf, id, dir){
+  const i = (wf.lanes || []).findIndex(l => l.id === id), j = i + dir;
+  if (i < 0 || j < 0 || j >= wf.lanes.length) return false;
+  const a = laneSpan(wf, i), b = laneSpan(wf, j);
+  for (const n of wf.nodes){
+    if (n.x >= a.x0 && n.x < a.x1) n.x += dir * LANE_W;
+    else if (n.x >= b.x0 && n.x < b.x1) n.x -= dir * LANE_W;
+  }
+  [wf.lanes[i], wf.lanes[j]] = [wf.lanes[j], wf.lanes[i]];
+  return true;
+}
+// Put every shape in its lane: owned steps go to their owner's lane, everything else follows a connected shape.
+function placeIntoLanes(wf){
+  if (!hasLanes(wf)) return wf;
+  const idx = new Map(wf.lanes.map((l, i) => [ownerKey(l.name), i]));
+  const lane = new Map();
+  for (const n of wf.nodes){
+    const k = ownerKey(n.owner);
+    if ((n.type === 'step' || n.type === 'decision') && idx.has(k)) lane.set(n.id, idx.get(k));
+  }
+  for (let pass = 0; pass < wf.nodes.length; pass++){
+    let grew = false;
+    for (const e of wf.edges){
+      if (lane.has(e.to) && !lane.has(e.from)){ lane.set(e.from, lane.get(e.to)); grew = true; }
+      else if (lane.has(e.from) && !lane.has(e.to)){ lane.set(e.to, lane.get(e.from)); grew = true; }
+    }
+    if (!grew) break;
+  }
+  const groups = wf.lanes.map(() => []);
+  for (const n of wf.nodes){
+    let i = lane.has(n.id) ? lane.get(n.id) : Math.floor((n.x - laneX0(wf)) / LANE_W);
+    i = Math.max(0, Math.min(wf.lanes.length - 1, i));
+    n.x = laneSpan(wf, i).cx;
+    groups[i].push(n);
+  }
+  for (const g of groups){ // no two shapes on top of each other in one lane
+    g.sort((a, b) => a.y - b.y);
+    for (let k = 1; k < g.length; k++){
+      const p = g[k-1], n = g[k], gap = SIZE[p.type].h/2 + SIZE[n.type].h/2 + 28;
+      if (n.y < p.y + gap) n.y = Math.ceil((p.y + gap) / 20) * 20;
+    }
+  }
+  return wf;
+}
+// One lane per owner, in the order owners first appear top to bottom; existing lanes are kept.
+function lanesFromOwners(wf){
+  const have = new Set((wf.lanes || []).map(l => ownerKey(l.name)));
+  const order = [...wf.nodes].sort((a, b) => a.y - b.y || a.x - b.x);
+  for (const n of order){
+    const k = ownerKey(n.owner);
+    if ((n.type === 'step' || n.type === 'decision') && k && !have.has(k)){ have.add(k); addLane(wf, n.owner.trim()); }
+  }
+  if (!hasLanes(wf)) return false;
+  placeIntoLanes(wf);
+  return true;
+}
+
 function makeHistory(limit){
   limit = limit || 100;
   return { undo:[], redo:[],
@@ -352,6 +460,7 @@ function ownerKey(o){ return (o || '').trim().toLowerCase(); }
 // Owners get colours in order of first appearance, so no two clash until there are more than 8.
 function ownerColors(wf){
   const m = new Map();
+  for (const l of (wf.lanes || [])){ const k = ownerKey(l.name); if (k && !m.has(k)) m.set(k, OWNER_COLORS[m.size % OWNER_COLORS.length]); }
   for (const n of wf.nodes){ const k = ownerKey(n.owner); if (k && !m.has(k)) m.set(k, OWNER_COLORS[m.size % OWNER_COLORS.length]); }
   return m;
 }
@@ -393,12 +502,19 @@ function edgeLine(a, b){
   const p = edgeAnchor(a, b.x, b.y), q = edgeAnchor(b, a.x, a.y);
   return { x1:p.x, y1:p.y, x2:q.x, y2:q.y, mx:(p.x+q.x)/2, my:(p.y+q.y)/2 };
 }
-function bounds(wf){
+function nodeBounds(wf){
   if (!wf.nodes.length) return { x:-300, y:-200, w:600, h:400 };
   let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
   for (const n of wf.nodes){ const s = SIZE[n.type];
     x0=Math.min(x0,n.x-s.w/2); y0=Math.min(y0,n.y-s.h/2); x1=Math.max(x1,n.x+s.w/2); y1=Math.max(y1,n.y+s.h/2); }
   return { x:x0, y:y0, w:x1-x0, h:y1-y0 };
+}
+function bounds(wf){ // shapes plus any lanes
+  const b = nodeBounds(wf);
+  if (!hasLanes(wf)) return b;
+  const ext = laneExtent(wf), lx0 = laneX0(wf), lx1 = lx0 + wf.lanes.length * LANE_W;
+  const x0 = Math.min(b.x, lx0), x1 = Math.max(b.x + b.w, lx1);
+  return { x:x0, y:ext.y0, w:x1 - x0, h:ext.y1 - ext.y0 };
 }
 function wrapText(t, maxChars, maxLines){
   const words = (t || '').split(/\s+/).filter(Boolean), lines = [];
@@ -475,13 +591,15 @@ function template(kind){
     const d = N('step',0,400,'Schedule payment','Accounts payable','QuickBooks',10);
     const e = N('end',0,520,'Paid');
     E(s,a); E(a,c); E(c,b,'Yes'); E(c,d,'No'); E(b,d,''); E(d,e);
+    lanesFromOwners(wf); // this one shows off swimlanes
   }
   return wf;
 }
 const TEMPLATES = [['onboarding','Client onboarding'],['fulfilment','Order fulfilment'],['invoice','Invoice approval']];
 
 if (typeof module !== 'undefined') module.exports = { autoLayout, validate, addNode, connect, removeNode, removeEdge, makeHistory, summary,
-  fmtMins, edgeAnchor, edgeLine, bounds, wrapText, encodeShare, decodeShare, template, emptyWorkflow, ownerColor, snap, SIZE };
+  fmtMins, edgeAnchor, edgeLine, bounds, nodeBounds, wrapText, addLane, removeLane, moveLane, clearLanes, claimOwner,
+  placeIntoLanes, lanesFromOwners, laneIndexAt, laneSpan, LANE_W, encodeShare, decodeShare, template, emptyWorkflow, ownerColor, snap, SIZE };
 // ==/LOGIC==
 
 // ==UI==
@@ -496,6 +614,7 @@ const COARSE = window.matchMedia('(pointer:coarse)').matches; // finger, not mou
   const closed = s ? s === 'closed' : window.matchMedia('(max-width:900px)').matches;
   app.classList.toggle('collapsed', closed);
 })();
+const laneLayer = document.getElementById('laneLayer');
 const cv = $('cv'), world = $('world'), edgeLayer = $('edgeLayer'), nodeLayer = $('nodeLayer'), tempLine = $('tempLine');
 
 let store = loadStore();
@@ -545,8 +664,11 @@ function change(fn){
 function undo(){ const p = hist.back(JSON.stringify(wf)); if (p){ wf = JSON.parse(p); fixSel(); persist(); render(); } }
 function redo(){ const p = hist.fwd(JSON.stringify(wf)); if (p){ wf = JSON.parse(p); fixSel(); persist(); render(); } }
 function fixSel(){
-  if (sel && !(sel.kind === 'node' ? findNode(wf, sel.id) : wf.edges.find(e => e.id === sel.id))) sel = null;
+  if (!sel) return;
+  const ok = sel.kind === 'node' ? findNode(wf, sel.id) : sel.kind === 'lane' ? (wf.lanes || []).find(l => l.id === sel.id) : wf.edges.find(e => e.id === sel.id);
+  if (!ok) sel = null;
 }
+function addAt(type, x, y){ const n = addNode(wf, type, x, y); claimOwner(wf, n); return n; } // inside a lane = owned by it
 
 // ---- drawing
 // Start is green, End is red, decisions are orange until they have an owner. Steps take their owner's colour.
@@ -620,15 +742,36 @@ function drawEdge(e, parent, forExport){
     t.textContent = e.label;
   }
 }
-function render(){
-  edgeLayer.textContent = ''; nodeLayer.textContent = '';
+function drawLanes(parent, forExport){
+  if (!hasLanes(wf)) return;
+  const ext = laneExtent(wf), hgt = ext.y1 - ext.y0;
+  wf.lanes.forEach((l, i) => {
+    const s = laneSpan(wf, i), oc = ownerColor(l.name, wf) || PLAIN;
+    const isSel = !forExport && sel && sel.kind === 'lane' && sel.id === l.id;
+    el('rect', { x:s.x0, y:ext.y0, width:LANE_W, height:hgt, fill: oc + (darkCv ? '14' : '0C') }, parent);
+    el('line', { x1:s.x0, y1:ext.y0, x2:s.x0, y2:ext.y1, stroke:HAIR }, parent);
+    if (i === wf.lanes.length - 1) el('line', { x1:s.x1, y1:ext.y0, x2:s.x1, y2:ext.y1, stroke:HAIR }, parent);
+    const g = el('g', { 'data-lane': l.id, style:'cursor:pointer' }, parent);
+    el('rect', { x:s.x0, y:ext.y0, width:LANE_W, height:LANE_HEAD, fill:PANEL, stroke: isSel ? INK : HAIR, 'stroke-width': isSel ? 2 : 1 }, g);
+    el('rect', { x:s.x0, y:ext.y0, width:LANE_W, height:4, fill:oc }, g);
+    const t = el('text', { x:s.cx, y:ext.y0 + 27, 'text-anchor':'middle', fill:INK, 'font-size':13, 'font-weight':600, 'font-family':FONT }, g);
+    t.textContent = wrapText(l.name, 30, 1)[0] || 'Lane';
+  });
+}
+function drawAll(){
+  laneLayer.textContent = ''; edgeLayer.textContent = ''; nodeLayer.textContent = '';
+  drawLanes(laneLayer);
   for (const e of wf.edges) drawEdge(e, edgeLayer);
   for (const n of wf.nodes) drawNode(n, nodeLayer);
+}
+function render(){
+  drawAll();
+  $('bLaneOff').style.display = hasLanes(wf) ? '' : 'none';
   applyView();
   renderDetails(); renderSummary(); renderList(); syncCtx();
   // small screens keep the details in a closed drawer, so offer a one-tap way in
   $('selEdit').style.display = sel && narrow() ? 'block' : 'none';
-  $('selEdit').textContent = sel && sel.kind === 'edge' ? 'Edit arrow' : 'Edit';
+  $('selEdit').textContent = sel && sel.kind === 'edge' ? 'Edit arrow' : sel && sel.kind === 'lane' ? 'Edit lane' : 'Edit';
   $('bUndo').disabled = !hist.undo.length; $('bRedo').disabled = !hist.redo.length;
 }
 function applyView(){ world.setAttribute('transform', `translate(${view.x},${view.y}) scale(${view.k})`); }
@@ -665,9 +808,7 @@ function field(label, value, onInput, opts){
   return h('label', { text: label }, [inp]);
 }
 function redraw(){ // canvas + summary only, keeps input focus
-  edgeLayer.textContent = ''; nodeLayer.textContent = '';
-  for (const e of wf.edges) drawEdge(e, edgeLayer);
-  for (const n of wf.nodes) drawNode(n, nodeLayer);
+  drawAll();
   renderSummary();
   if (ctx.classList.contains('show') && ctx.contains(document.activeElement)) renderDetails(); // typing in the right-click menu: keep the sidebar in step
 }
@@ -693,8 +834,8 @@ function openCtx(x, y, focus){
   ctx.dataset.id = sel.id; fillCtx(); placeCtx(x, y);
   if (focus || !COARSE){ const f = $('cfTitle') || $('cfLabel'); if (f){ f.focus(); f.select(); } } // on touch, do not pop the keyboard uninvited
 }
-function menuAt(nid, eid, x, y){ // right-click, or a long press on touch
-  if (nid || eid){ sel = nid ? { kind:'node', id:nid } : { kind:'edge', id:eid }; render(); openCtx(x, y); }
+function menuAt(nid, eid, x, y, lid){ // right-click, or a long press on touch
+  if (nid || eid || lid){ sel = nid ? { kind:'node', id:nid } : eid ? { kind:'edge', id:eid } : { kind:'lane', id:lid }; render(); openCtx(x, y); }
   else { if (sel){ sel = null; render(); } openAddCtx(x, y); }
 }
 function openAddCtx(x, y){
@@ -703,10 +844,14 @@ function openAddCtx(x, y){
   const grid = h('div', { className:'grid2' }), w = toWorld(x, y);
   for (const [t, l] of [['start','Start'],['step','Step'],['decision','Decision'],['end','End']]){
     const b = h('button', { text:l });
-    b.onclick = () => { let n; closeCtx(); change(() => { n = addNode(wf, t, w.x, w.y); }); sel = { kind:'node', id:n.id }; render(); };
+    b.onclick = () => { let n; closeCtx(); change(() => { n = addAt(t, w.x, w.y); }); sel = { kind:'node', id:n.id }; render(); };
     grid.appendChild(b);
   }
-  ctx.appendChild(grid); placeCtx(x, y);
+  ctx.appendChild(grid);
+  const lb = h('button', { text:'Add a swimlane', style:'width:100%;margin-top:6px' });
+  lb.onclick = () => { closeCtx(); newLane(); };
+  ctx.appendChild(lb);
+  placeCtx(x, y);
 }
 function syncCtx(){
   if (!ctx.classList.contains('show') || !ctx.dataset.id) return;
@@ -736,7 +881,7 @@ function buildDetails(box, p){ // p = id prefix: '' for the sidebar, 'c' for the
       const r = h('div', { className:'row', style:'margin-bottom:12px' });
       for (const [t, l] of [['step','Step'],['decision','Decision'],['end','End']]){
         const b = h('button', { text:l });
-        b.onclick = () => { let m; closeCtx(); change(() => { m = addNode(wf, t, n.x, n.y + 120); connect(wf, n.id, m.id); }); sel = { kind:'node', id:m.id }; render(); };
+        b.onclick = () => { let m; closeCtx(); change(() => { m = addAt(t, n.x, n.y + 120); connect(wf, n.id, m.id); }); sel = { kind:'node', id:m.id }; render(); };
         r.appendChild(b);
       }
       box.appendChild(r);
@@ -750,12 +895,33 @@ function buildDetails(box, p){ // p = id prefix: '' for the sidebar, 'c' for the
     const a = findNode(wf, e.from), b = findNode(wf, e.to);
     box.appendChild(h('p', { className:'muted', text: (a.title || '?') + ' → ' + (b.title || '?'), style:'margin-bottom:10px' }));
     box.appendChild(field('Label (e.g. Yes / No)', e.label, v => e.label = v, { max:40, id: p + 'fLabel' }));
+    const chips = h('div', { className:'row', style:'margin:-4px 0 12px' });
+    for (const v of ['Yes','No','Approved','Rejected','Later','None']){
+      const c = h('button', { text:v, style:'flex:0 0 auto;padding:5px 9px;font-size:12px' + ((v === 'None' ? !e.label : e.label === v) ? ';background:var(--accent);color:#fff' : '') });
+      c.onclick = () => change(() => { e.label = v === 'None' ? '' : v; });
+      chips.appendChild(c);
+    }
+    box.appendChild(chips);
     const row = h('div', { className:'row' });
     const flip = h('button', { text:'Reverse' });
     flip.onclick = () => change(() => { const t = e.from; e.from = e.to; e.to = t; });
     const del = h('button', { className:'danger', text:'Delete arrow' });
     del.onclick = deleteSel;
     row.append(flip, del); box.appendChild(row);
+  } else if (sel && sel.kind === 'lane'){
+    const l = wf.lanes.find(x => x.id === sel.id), i = wf.lanes.indexOf(l);
+    box.appendChild(h('h2', { text:'Swimlane' }));
+    box.appendChild(h('p', { className:'muted', style:'margin-bottom:10px', text:'Steps you drop in this lane get this owner. Renaming the lane renames the owner on its steps.' }));
+    const members = wf.nodes.filter(n => ownerKey(n.owner) && ownerKey(n.owner) === ownerKey(l.name)); // fixed while typing
+    box.appendChild(field('Lane name (owner)', l.name, v => { l.name = v.slice(0, 40); for (const n of members) n.owner = l.name; }, { max:40, id: p + 'fTitle' }));
+    const row = h('div', { className:'row', style:'margin-bottom:8px' });
+    const left = h('button', { text:'← Move', disabled: i === 0 }), right = h('button', { text:'Move →', disabled: i === wf.lanes.length - 1 });
+    left.onclick = () => change(() => moveLane(wf, l.id, -1));
+    right.onclick = () => change(() => moveLane(wf, l.id, 1));
+    row.append(left, right); box.appendChild(row);
+    const del = h('button', { className:'danger', text:'Delete lane' });
+    del.onclick = deleteSel;
+    box.appendChild(del);
   } else {
     box.appendChild(h('h2', { text:'Details' }));
     box.appendChild(h('p', { className:'muted', text:'Click a shape to say who does it, with what, and how long it takes. Drag its blue square to connect it to the next one.' }));
@@ -821,8 +987,20 @@ $('wfName').addEventListener('change', () => { if (nameBefore && JSON.stringify(
 function deleteSel(){
   if (!sel) return;
   const s = sel; sel = null;
-  change(() => s.kind === 'node' ? removeNode(wf, s.id) : removeEdge(wf, s.id));
+  change(() => s.kind === 'node' ? removeNode(wf, s.id) : s.kind === 'lane' ? removeLane(wf, s.id) : removeEdge(wf, s.id));
 }
+function newLane(){
+  let l; change(() => { l = addLane(wf); });
+  if (!l){ toast('That is the most lanes a workflow can have (' + LIMITS.lanes + ')'); return; }
+  sel = { kind:'lane', id:l.id }; render(); focusName();
+}
+$('bLane').onclick = newLane;
+$('bLaneAuto').onclick = () => {
+  let ok = false; change(() => { ok = lanesFromOwners(wf); });
+  if (!ok){ toast('Give your steps owners first. Each owner becomes a lane.'); return; }
+  fit(); toast('One lane per owner. Drag a step into another lane to hand it over.');
+};
+$('bLaneOff').onclick = () => { change(() => clearLanes(wf)); fixSel(); render(); toast('Lanes removed. Your shapes and owners are unchanged.'); };
 function focusName(){
   if (narrow()){ if (sel) openCtx(0, 0, true); return; } // small screens: edit in the sheet, not the drawer
   if (app.classList.contains('collapsed')) setSidebar(true); const f = $('fTitle') || $('fLabel'); if (f){ f.focus(); f.select(); } }
@@ -867,11 +1045,11 @@ cv.addEventListener('pointerdown', e => {
     return;
   }
   const p = toWorld(e.clientX, e.clientY);
-  const handle = e.target.closest('[data-handle]'), nodeEl = e.target.closest('[data-node]'), edgeEl = e.target.closest('[data-edge]');
+  const handle = e.target.closest('[data-handle]'), nodeEl = e.target.closest('[data-node]'), edgeEl = e.target.closest('[data-edge]'), laneEl = e.target.closest('[data-lane]');
   cv.setPointerCapture(e.pointerId);
   if (e.pointerType !== 'mouse' && !handle){
-    const nid = nodeEl && nodeEl.getAttribute('data-node'), eid = edgeEl && edgeEl.getAttribute('data-edge'), x = e.clientX, y = e.clientY;
-    lp = { x, y, t: setTimeout(() => { lp = null; cancelDrag(); menuAt(nid, eid, x, y); }, 520) };
+    const nid = nodeEl && nodeEl.getAttribute('data-node'), eid = edgeEl && edgeEl.getAttribute('data-edge'), lid = laneEl && laneEl.getAttribute('data-lane'), x = e.clientX, y = e.clientY;
+    lp = { x, y, t: setTimeout(() => { lp = null; cancelDrag(); menuAt(nid, eid, x, y, lid); }, 520) };
   }
   if (handle){
     const n = findNode(wf, handle.getAttribute('data-handle'));
@@ -890,6 +1068,12 @@ cv.addEventListener('pointerdown', e => {
     const now = Date.now(), dbl = lastTap.id === id && now - lastTap.t < 400;
     lastTap = { id, t: now };
     sel = { kind:'edge', id }; render(); drag = null;
+    if (dbl) focusName();
+  } else if (laneEl){
+    const id = laneEl.getAttribute('data-lane');
+    const now = Date.now(), dbl = lastTap.id === id && now - lastTap.t < 400;
+    lastTap = { id, t: now };
+    sel = { kind:'lane', id }; render(); drag = null;
     if (dbl) focusName();
   } else {
     if (sel){ sel = null; render(); }
@@ -924,7 +1108,7 @@ function endDrag(e){
   if (!drag) return;
   const d = drag; drag = null;
   cv.classList.remove('panning');
-  if (d.mode === 'move' && d.moved){ hist.push(d.before); persist(); render(); }
+  if (d.mode === 'move' && d.moved){ claimOwner(wf, findNode(wf, d.id)); hist.push(d.before); persist(); render(); }
   if (d.mode === 'connect'){
     tempLine.setAttribute('visibility', 'hidden');
     const t = document.elementFromPoint(e.clientX, e.clientY);
@@ -937,7 +1121,7 @@ function endDrag(e){
       // dropped on empty canvas: create a new step there, connected
       const p = toWorld(e.clientX, e.clientY);
       let n;
-      change(() => { n = addNode(wf, 'step', p.x, p.y); connect(wf, d.from, n.id); });
+      change(() => { n = addAt('step', p.x, p.y); connect(wf, d.from, n.id); });
       sel = { kind:'node', id: n.id }; render(); focusName();
     }
   }
@@ -946,9 +1130,9 @@ cv.addEventListener('pointerup', endDrag);
 cv.addEventListener('pointercancel', e => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; cancelDrag(); });
 cv.addEventListener('contextmenu', e => {
   e.preventDefault();
-  const nodeEl = e.target.closest('[data-node]'), edgeEl = e.target.closest('[data-edge]');
+  const nodeEl = e.target.closest('[data-node]'), edgeEl = e.target.closest('[data-edge]'), laneEl = e.target.closest('[data-lane]');
   cancelDrag();
-  menuAt(nodeEl && nodeEl.getAttribute('data-node'), edgeEl && edgeEl.getAttribute('data-edge'), e.clientX, e.clientY);
+  menuAt(nodeEl && nodeEl.getAttribute('data-node'), edgeEl && edgeEl.getAttribute('data-edge'), e.clientX, e.clientY, laneEl && laneEl.getAttribute('data-lane'));
 });
 cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.12 : 1/1.12, e.clientX, e.clientY); }, { passive:false });
 $('zIn').onclick = () => zoomAt(1.2); $('zOut').onclick = () => zoomAt(1/1.2); $('zFit').onclick = fit;
@@ -971,14 +1155,14 @@ document.querySelectorAll('.pal').forEach(p => {
     if (!g.moved){ // tap: place below the selected shape, or at the view centre
       const s = sel && sel.kind === 'node' && findNode(wf, sel.id);
       let n;
-      if (s){ change(() => { n = addNode(wf, g.type, s.x, s.y + 120); if (s.type !== 'end') connect(wf, s.id, n.id); }); }
-      else { const c = toWorld(r.left + r.width/2, r.top + r.height/2); change(() => { n = addNode(wf, g.type, c.x, c.y); }); }
+      if (s){ change(() => { n = addAt(g.type, s.x, s.y + 120); if (s.type !== 'end') connect(wf, s.id, n.id); }); }
+      else { const c = toWorld(r.left + r.width/2, r.top + r.height/2); change(() => { n = addAt(g.type, c.x, c.y); }); }
       sel = { kind:'node', id:n.id }; render();
       if (narrow()) setSidebar(false); // phone drawer covers the canvas, so get out of the way
       return;
     }
     const w = toWorld(cx, cy);
-    let n; change(() => { n = addNode(wf, g.type, w.x, w.y); });
+    let n; change(() => { n = addAt(g.type, w.x, w.y); });
     sel = { kind:'node', id:n.id }; render();
   });
 });
@@ -1050,6 +1234,7 @@ function exportSvg(){
   el('rect', { x:b.x - pad, y:b.y - pad - 40, width:b.w + pad*2, height:b.h + pad*2 + 40, fill:PAPER }, s);
   const t = el('text', { x:b.x - pad + 20, y:b.y - pad - 8, fill:INK, 'font-size':18, 'font-weight':700, 'font-family':FONT }, s);
   t.textContent = wf.name;
+  drawLanes(el('g', {}, s), true);
   const eg = el('g', {}, s), ng = el('g', {}, s);
   for (const e of wf.edges) drawEdge(e, eg, true);
   for (const n of wf.nodes) drawNode(n, ng, true);
@@ -1089,7 +1274,7 @@ function patch(n, f){
 }
 window.OpsFlow = {
   version: 1,
-  help: 'OpsFlow agent API (window.OpsFlow). get() -> {name,nodes,edges}. load(workflow) opens it as a new workflow and returns it; a node is {id, type: start|step|decision|end, title, owner, tool, mins, notes, next:[id or {to,label}]}; leave out x and y and the layout is done for you. add(node, afterId) -> id. update(id, fields). remove(id). connect(from, to, label) -> arrow id. rename(name). tidy() re-does the layout. summary() -> steps, total minutes, time per owner, tools. json() -> file text. shareLink() -> Promise<url>. png() -> Promise<Blob>. No page needed: any URL ending in #w=j.<URL-encoded workflow JSON> opens that workflow.',
+  help: 'OpsFlow agent API (window.OpsFlow). get() -> {name,nodes,edges}. load(workflow) opens it as a new workflow and returns it; a node is {id, type: start|step|decision|end, title, owner, tool, mins, notes, next:[id or {to,label}]}; leave out x and y and the layout is done for you. add(node, afterId) -> id. update(id, fields). remove(id). connect(from, to, label) -> arrow id. rename(name). tidy() re-does the layout. Swimlanes: put lanes:["Sales","Ops"] in a loaded workflow (steps go to the lane matching their owner), or call addLane(name) -> id, lanesFromOwners() -> true if any lanes, removeLane(id), clearLanes(). summary() -> steps, total minutes, time per owner, tools. json() -> file text. shareLink() -> Promise<url>. png() -> Promise<Blob>. No page needed: any URL ending in #w=j.<URL-encoded workflow JSON> opens that workflow.',
   get: () => JSON.parse(JSON.stringify(wf)),
   load(obj){ addItem(validate(typeof obj === 'string' ? JSON.parse(obj) : obj)); return this.get(); },
   add(node, afterId){
@@ -1106,7 +1291,11 @@ window.OpsFlow = {
   remove(id){ if (!findNode(wf, id)) return false; change(() => removeNode(wf, id)); return true; },
   connect(from, to, label){ let e; change(() => { e = connect(wf, from, to); if (e && label !== undefined) e.label = str(String(label), 40); }); return e ? e.id : null; },
   rename(name){ change(() => { wf.name = str(String(name), LIMITS.name) || 'Untitled workflow'; }); return wf.name; },
-  tidy(){ change(() => autoLayout(wf)); fit(); },
+  tidy(){ change(() => { autoLayout(wf); placeIntoLanes(wf); }); fit(); },
+  addLane(name){ let l; change(() => { l = addLane(wf, String(name || '')); }); return l ? l.id : null; },
+  lanesFromOwners(){ let ok = false; change(() => { ok = lanesFromOwners(wf); }); if (ok) fit(); return ok; },
+  removeLane(id){ if (!(wf.lanes || []).some(l => l.id === id)) return false; change(() => removeLane(wf, id)); fixSel(); render(); return true; },
+  clearLanes(){ change(() => clearLanes(wf)); fixSel(); render(); },
   summary: () => summary(wf),
   json: () => jsonText(),
   shareLink: () => shareUrl(),
